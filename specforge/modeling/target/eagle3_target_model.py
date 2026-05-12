@@ -80,6 +80,7 @@ class Eagle3TargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        return_last_hidden_states: bool = False,
     ) -> Eagle3TargetOutput:
         """
         Generate the eagle3 data from the target model.
@@ -173,6 +174,7 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        return_last_hidden_states: bool = False,
     ) -> Eagle3TargetOutput:
         """
         Optimized HF backend:
@@ -688,6 +690,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
+        return_last_hidden_states: bool = False,
     ) -> Eagle3TargetOutput:
         """
         return:
@@ -706,7 +709,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                     input_ids,
                     attention_mask,
                     loss_mask,
-                    return_last_hidden_states=False,
+                    return_last_hidden_states=return_last_hidden_states,
                     return_logits=True,
                     pixel_values=pixel_values,
                     image_grid_thw=image_grid_thw,
@@ -718,7 +721,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                     input_ids,
                     attention_mask,
                     loss_mask,
-                    return_last_hidden_states=False,
+                    return_last_hidden_states=return_last_hidden_states,
                     return_logits=True,
                 )
             )
@@ -761,6 +764,8 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
 
         if last_hidden_states_out[0] is not None:
             last_hidden_states_out = torch.cat(last_hidden_states_out, dim=0)
+            # shift left to align with target_out: position i holds hs at i+1
+            last_hidden_states_out = padding(last_hidden_states_out, left=False)
         else:
             last_hidden_states_out = None
 
@@ -810,6 +815,7 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        return_last_hidden_states: bool = False,
     ) -> Eagle3TargetOutput:
         outputs = self.model(
             input_ids=input_ids,

@@ -7,23 +7,28 @@ NUM_GPUS=${1:-1}
 TP_SIZE=${2:-1}
 BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-64}
 
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3.py \
-    --target-model-path meta-llama/Llama-3.1-8B-Instruct \
+    --target-model-path /local/mnt/workspace/ziantan/model \
     --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3-sharegpt \
     --num-epochs 10 \
-    --batch-size 1 \
+    --batch-size 2 \
     --tp-size $TP_SIZE \
     --learning-rate 1e-4 \
-    --max-length 4096 \
+    --max-length 1024 \
     --chat-template llama3 \
     --cache-dir $ROOT_DIR/cache \
     --attention-backend sdpa \
     --target-model-backend sglang \
     --log-interval 10 \
-    --sglang-mem-fraction-static 0.25
+    --sglang-mem-fraction-static 0.25 \
+    --report-to tensorboard
+# max-lenth:输入输出最多2048个token

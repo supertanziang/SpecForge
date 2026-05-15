@@ -14,21 +14,23 @@ torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3.py \
-    --target-model-path /local/mnt/workspace/ziantan/model \
+    --target-model-path /prj/corp/crd/morpheus/lasvegas/china-scratch/ziantan/EAGLE/hub/Meta-Llama-3.1-8B-Instruct \
     --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
-    --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3-sharegpt \
-    --num-epochs 5 \
-    --batch-size 2 \
+    --output-dir /prj/corp/crd/morpheus/lasvegas/china-scratch/ziantan/SpecForge/outputs/llama3-8b-eagle3-sharegpt_addfeature_loss \
+    --num-epochs 10 \
+    --batch-size 4 \
     --tp-size $TP_SIZE \
     --learning-rate 1e-4 \
-    --max-length 1024 \
+    --max-length 2048 \
     --chat-template llama3 \
     --cache-dir $ROOT_DIR/cache \
     --attention-backend sdpa \
     --target-model-backend sglang \
     --log-interval 10 \
-    --sglang-mem-fraction-static 0.2 \
-    --report-to tensorboard
+    --sglang-mem-fraction-static 0.3 \
+    --report-to tensorboard \
+    --resume 
+
 # max-lenth:输入输出最多2048个token

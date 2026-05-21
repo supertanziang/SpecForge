@@ -196,6 +196,7 @@ outputs/
 wandb/
 .idea
 .vscode/
+run_*.txt
 
 # macOS
 .DS_Store

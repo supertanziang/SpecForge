@@ -5,12 +5,12 @@ Usage:
 # if you want to run benchmarks directly
 # mtbench:20 means only run 20 samples in the dataset
 python bench_eagle3.py \
-    --model meta-llama/Llama-3.1-8B-Instruct   \
+    --model /prj/corp/crd/morpheus/lasvegas/china-scratch/Models/Meta-Llama-3.1-8B-Instruct \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B \
-    --port 30000 \
-    --config-list 1,0,0,0 1,3,1,4 \
-    --benchmark-list mtbench:20 \
+    --speculative-draft-model-path /prj/corp/crd/morpheus/lasvegas/china-scratch/ziantan/SpecForge/outputs/llama3-8b-eagle3-sharegpt_onlyhighfeature/epoch_14_step_36945 \
+    --port 3435 \
+    --config-list 1,0,0,0 1,6,10,60 \
+    --benchmark-list mtbench:10 gsm8k:10 \
     --dtype bfloat16
 
 

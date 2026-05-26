@@ -140,7 +140,6 @@ class OnlineEagle3Model(Eagle3Model):
         position_ids: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
-        last_hidden_states: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """
@@ -206,19 +205,6 @@ class OnlineEagle3Model(Eagle3Model):
         vlosses = []
         acces = []
         adapter = self._make_adapter()
-
-        # Pad last_hidden_states for fea con vloss alignment across TTT steps
-        if last_hidden_states is not None:
-            last_hidden_states_padded = F.pad(
-                last_hidden_states,
-                pad=(0, 0, 0, self.length),
-                mode="constant",
-                value=0.0,
-            )
-            del last_hidden_states  # free original, only keep padded version
-        else:
-            last_hidden_states_padded = None
-
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
         global_input_ids = input_ids
         if self.attention_backend in ["sdpa", "fa", "usp"]:
@@ -262,19 +248,6 @@ class OnlineEagle3Model(Eagle3Model):
 
             # update hidden states for next step
             hidden_states = hidden_states_out
-
-            # Step 5.3: feature constraint loss (fea con / vloss)
-            if last_hidden_states_padded is not None:
-                target_h = last_hidden_states_padded[:, idx : idx + seq_length, :].contiguous()
-                if is_last:
-                    del last_hidden_states_padded
-                    last_hidden_states_padded = None
-                vloss_raw = F.smooth_l1_loss(hidden_states_out, target_h, reduction="none")
-                del target_h
-                vloss = (state.loss_mask * vloss_raw).mean(-1).sum() / state.loss_mask.sum().clamp_min(1e-6)
-                del vloss_raw
-                vloss = adapter.reduce_loss(vloss)
-                vlosses.append(vloss)
 
             # Step 5.4: get logits
             logits = self.draft_model.compute_logits(hidden_states)

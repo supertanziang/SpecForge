@@ -80,7 +80,6 @@ class Eagle3TargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-        return_last_hidden_states: bool = False,
     ) -> Eagle3TargetOutput:
         """
         Generate the eagle3 data from the target model.
@@ -99,15 +98,8 @@ class Eagle3TargetModel(ABC):
                 raise ValueError(
                     f"Failed to set aux hidden states layers as model config {self.model.config} does not have num_hidden_layers"
                 )
-            aux_hidden_states_layers = [
-                1,
-                num_layers // 2 - 1,
-                num_layers - 4,
-            ]
+            aux_hidden_states_layers = [num_layers - 4]
         self.aux_hidden_states_layers = aux_hidden_states_layers
-        assert (
-            len(self.aux_hidden_states_layers) == 3
-        ), "aux_hidden_states_layers is expected to be 3 layers for EAGLE3"
 
 
 class HFEagle3TargetModel(Eagle3TargetModel):
@@ -174,7 +166,6 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-        return_last_hidden_states: bool = False,
     ) -> Eagle3TargetOutput:
         """
         Optimized HF backend:
@@ -227,19 +218,12 @@ class HFEagle3TargetModel(Eagle3TargetModel):
                 handle.remove()
 
         # Verify we captured everything
-        if len(captured_states) != 3:
+        if len(captured_states) != len(target_indices):
             raise RuntimeError(
-                f"Expected to capture 3 layers, but captured {len(captured_states)}"
+                f"Expected to capture {len(target_indices)} layers, but captured {len(captured_states)}"
             )
 
-        # Extract in the correct order
-        hidden_states0 = captured_states[target_indices[0]]
-        hidden_states1 = captured_states[target_indices[1]]
-        hidden_states2 = captured_states[target_indices[2]]
-
-        hidden_states = torch.cat(
-            (hidden_states0, hidden_states1, hidden_states2), dim=-1
-        )
+        hidden_states = captured_states[target_indices[-1]]
 
         # apply pading
         target = outputs.logits
@@ -351,6 +335,12 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
     ) -> None:
+        if aux_hidden_states_layers is None:
+            hf_config = self.hf_config or getattr(
+                self.model_runner.model_config, "hf_config", None
+            )
+            if hf_config is not None and hasattr(hf_config, "num_hidden_layers"):
+                aux_hidden_states_layers = [hf_config.num_hidden_layers - 4]
         self.model_runner.model.set_eagle3_layers_to_capture(aux_hidden_states_layers)
 
     @torch.no_grad
@@ -690,7 +680,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         is_vlm: bool = False,
-        return_last_hidden_states: bool = False,
     ) -> Eagle3TargetOutput:
         """
         return:
@@ -709,7 +698,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                     input_ids,
                     attention_mask,
                     loss_mask,
-                    return_last_hidden_states=return_last_hidden_states,
+                    return_last_hidden_states=False,
                     return_logits=True,
                     pixel_values=pixel_values,
                     image_grid_thw=image_grid_thw,
@@ -721,7 +710,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
                     input_ids,
                     attention_mask,
                     loss_mask,
-                    return_last_hidden_states=return_last_hidden_states,
+                    return_last_hidden_states=False,
                     return_logits=True,
                 )
             )
@@ -764,8 +753,6 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
 
         if last_hidden_states_out[0] is not None:
             last_hidden_states_out = torch.cat(last_hidden_states_out, dim=0)
-            # shift left to align with target_out: position i holds hs at i+1
-            last_hidden_states_out = padding(last_hidden_states_out, left=False)
         else:
             last_hidden_states_out = None
 
@@ -815,7 +802,6 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-        return_last_hidden_states: bool = False,
     ) -> Eagle3TargetOutput:
         outputs = self.model(
             input_ids=input_ids,
@@ -827,7 +813,7 @@ class CustomEagle3TargetModel(Eagle3TargetModel):
 
         # For custom backends, the model implementation is responsible for only
         # returning the requested layers in `outputs.hidden_states`.
-        hidden_states = torch.cat(outputs.hidden_states, dim=-1)
+        hidden_states = outputs.hidden_states[-1]
 
         target = outputs.logits
         target = padding(target, left=False)

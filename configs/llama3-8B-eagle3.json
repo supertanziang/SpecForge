@@ -20,5 +20,9 @@
   "transformers_version": "4.28.1",
   "use_cache": true,
   "vocab_size": 128256,
-  "draft_vocab_size": 32000
+  "draft_vocab_size": 32000,
+  "eagle_config": {
+    "use_aux_hidden_state": true,
+    "eagle_aux_hidden_state_layer_ids": [28]
+  }
 }

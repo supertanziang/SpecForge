@@ -143,12 +143,6 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     )
     training_group.add_argument("--max-grad-norm", type=float, default=0.5)
     training_group.add_argument(
-        "--vloss-weight",
-        type=float,
-        default=1,
-        help="Weight for the feature constraint loss (fea con / vloss). Set > 0 to enable.",
-    )
-    training_group.add_argument(
         "--ttt-length",
         type=int,
         default=7,
@@ -603,9 +597,9 @@ def run_forward(
     data: dict,
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     if args.is_vlm and args.target_model_backend == "custom":
-        plosses, vlosses, acces = eagle3_model(
+        plosses, _, acces = eagle3_model(
             input_ids=data["input_ids"].cuda(),
             attention_mask=data["attention_mask"].cuda(),
             loss_mask=data["loss_mask"].cuda(),
@@ -632,14 +626,12 @@ def run_forward(
                     is_vlm=args.is_vlm,
                     pixel_values=pixel_values,
                     image_grid_thw=image_grid_thw,
-                    return_last_hidden_states=(args.vloss_weight > 0),
                 )
             else:
                 eagle3_data = target_model.generate_eagle3_data(
                     input_ids=data["input_ids"].cuda(),
                     attention_mask=data["attention_mask"].cuda(),
                     loss_mask=data["loss_mask"].cuda(),
-                    return_last_hidden_states=(args.vloss_weight > 0),
                 )
 
             input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
@@ -647,12 +639,6 @@ def run_forward(
             loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
             target = get_dp_data_shard_from_tp(eagle3_data.target)
             hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
-            last_hidden_states = (
-                get_dp_data_shard_from_tp(eagle3_data.last_hidden_states)
-                if eagle3_data.last_hidden_states is not None
-                else None
-            )
-            del eagle3_data
         else:
             # we generate the logits using the hidden states loaded from disk
             attention_mask = data["attention_mask"].cuda()
@@ -665,8 +651,7 @@ def run_forward(
                 target.cuda()
             )  # The `data['target']` value occupies a large amount of GPU memory, with a shape of [seqlen, vocab_size]. It needs to be processed before being loaded into the GPU.
             loss_mask = loss_mask.cuda()
-            last_hidden_states = None
-        plosses, vlosses, acces = eagle3_model(
+        plosses, _, acces = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
@@ -677,30 +662,19 @@ def run_forward(
             ),
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
-            last_hidden_states=last_hidden_states,
         )
-    return plosses, vlosses, acces
+    return plosses, acces
 
 
 def run_backward_and_update(
-    args: Namespace,
-    plosses: List[torch.Tensor],
-    optimizer: Optimizer,
-    global_step: int,
-    vlosses: Optional[List[torch.Tensor]] = None,
+    args: Namespace, plosses: List[torch.Tensor], optimizer: Optimizer, global_step: int
 ) -> None:
     ploss_weight = [0.8**i for i in range(len(plosses))]
-    total_loss = (
+    ploss = (
         sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
         / args.draft_accumulation_steps
     )
-    if vlosses and args.vloss_weight > 0:
-        vloss_total = (
-            sum([ploss_weight[i] * vlosses[i] for i in range(len(vlosses))])
-            / args.draft_accumulation_steps
-        )
-        total_loss = total_loss + args.vloss_weight * vloss_total
-    total_loss.backward()
+    ploss.backward()
 
     if global_step % args.draft_accumulation_steps == 0:
         optimizer.step()
@@ -714,7 +688,6 @@ def record_metrcs(
     tracker: Tracker,
     optimizer: Optional[Optimizer] = None,
     mode: str = "train",
-    vlosses: Optional[List[torch.Tensor]] = None,
 ) -> None:
     logdict = {}
 
@@ -740,17 +713,6 @@ def record_metrcs(
         print_on_rank0(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {plosses[i]}"
         )
-
-    if vlosses:
-        vlosses_tensor = torch.stack(vlosses)
-        dist.all_reduce(vlosses_tensor, op=dist.ReduceOp.AVG)
-        vlosses_list = vlosses_tensor.cpu().tolist()
-        for i in range(len(vlosses_list)):
-            logdict[f"{mode}/vloss_{i}"] = vlosses_list[i]
-            print_on_rank0(
-                f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, vLoss: {vlosses_list[i]}"
-            )
-
     tracker.log(logdict, step=global_step)
 
 
@@ -947,14 +909,14 @@ def main():
             # ================================================
             # 7.1 Training Step
             # ================================================
-            plosses, vlosses, acces = run_forward(
+            plosses, acces = run_forward(
                 args,
                 eagle3_model,
                 data,
                 target_model,
                 is_online,
             )
-            run_backward_and_update(args, plosses, optimizer, global_step, vlosses)
+            run_backward_and_update(args, plosses, optimizer, global_step)
 
             # log training metrics
             if global_step % (args.log_interval * args.draft_accumulation_steps) == 0:
@@ -966,7 +928,6 @@ def main():
                     tracker,
                     optimizer,
                     mode="train",
-                    vlosses=vlosses if vlosses else None,
                 )
 
             if dist.get_rank() == 0:
@@ -998,11 +959,10 @@ def main():
                 draft_model.eval()
                 eval_acces = [[] for _ in range(eagle3_model.length)]
                 eval_plosses = [[] for _ in range(eagle3_model.length)]
-                eval_vlosses = [[] for _ in range(eagle3_model.length)]
 
                 for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                     with torch.no_grad():
-                        plosses, vlosses, acces = run_forward(
+                        plosses, acces = run_forward(
                             args, eagle3_model, data, target_model, is_online
                         )
                         eval_acces = [
@@ -1011,19 +971,10 @@ def main():
                         eval_plosses = [
                             eval_plosses[i] + [plosses[i]] for i in range(len(plosses))
                         ]
-                        if vlosses:
-                            eval_vlosses = [
-                                eval_vlosses[i] + [vlosses[i]] for i in range(len(vlosses))
-                            ]
 
                 # compute average over all minibatches
                 eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
                 eval_plosses = [torch.stack(pl).mean() for pl in eval_plosses]
-                eval_vlosses_avg = (
-                    [torch.stack(vl).mean() for vl in eval_vlosses if vl]
-                    if any(eval_vlosses)
-                    else None
-                )
 
                 record_metrcs(
                     args,
@@ -1032,7 +983,6 @@ def main():
                     global_step // args.draft_accumulation_steps,
                     tracker,
                     mode="eval",
-                    vlosses=eval_vlosses_avg,
                 )
             # ================================================
             # 7.3 Save Checkpoints

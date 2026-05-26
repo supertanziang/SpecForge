@@ -5,12 +5,12 @@ Usage:
 # if you want to run benchmarks directly
 # mtbench:20 means only run 20 samples in the dataset
 python bench_eagle3.py \
-    --model /prj/corp/crd/morpheus/lasvegas/china-scratch/Models/Meta-Llama-3.1-8B-Instruct   \
+    --model meta-llama/Llama-3.1-8B-Instruct   \
     --speculative-algorithm EAGLE3 \
-    --speculative-draft-model-path /prj/corp/crd/morpheus/lasvegas/china-scratch/ziantan/SpecForge/outputs/llama3-8b-eagle3-sharegpt/epoch_14_step_46272 \
+    --speculative-draft-model-path lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B \
     --port 30000 \
-    --config-list 1,0,0,0 1,4,2,10 \
-    --benchmark-list  mtbench:50 gsm8k:50 \
+    --config-list 1,0,0,0 1,3,1,4 \
+    --benchmark-list mtbench:20 \
     --dtype bfloat16
 
 
@@ -176,50 +176,6 @@ def send_flush_cache_request(base_url: str):
     requests.post(base_url + "/flush_cache")
 
 
-def compute_speedup_and_acceptance_rate(results: dict):
-    """
-    For each benchmark, augment every config entry in `results` with:
-      - speedup_ratio: avg output_throughput / baseline avg output_throughput,
-        where baseline is the config with steps == 0 (no speculative decoding).
-      - average_acceptance_rate: (accept_length - 1) / steps, i.e. the per-step
-        draft acceptance probability alpha. accept_length here is the average
-        accept length eta reported by SGLang (eta == 1 means no draft accepted).
-    """
-    for benchmark_name, benchmark_results in results.items():
-        if not isinstance(benchmark_results, list):
-            continue
-
-        baseline_throughput = None
-        for cfg in benchmark_results:
-            if (cfg.get("steps") or 0) == 0:
-                metrics = cfg.get("metrics") or []
-                if metrics:
-                    baseline_throughput = sum(
-                        m["output_throughput"] for m in metrics
-                    ) / len(metrics)
-                break
-
-        for cfg in benchmark_results:
-            metrics = cfg.get("metrics") or []
-            if not metrics:
-                cfg["speedup_ratio"] = None
-                cfg["average_acceptance_rate"] = None
-                continue
-
-            avg_throughput = sum(m["output_throughput"] for m in metrics) / len(metrics)
-            avg_accept_length = sum(m["accept_length"] for m in metrics) / len(metrics)
-            steps = cfg.get("steps") or 0
-
-            cfg["speedup_ratio"] = (
-                avg_throughput / baseline_throughput
-                if baseline_throughput
-                else None
-            )
-            cfg["average_acceptance_rate"] = (
-                (avg_accept_length - 1) / steps if steps > 0 else None
-            )
-
-
 def main():
     args = parse_args()
     server_args: ServerArgs = ServerArgs.from_cli_args(args)
@@ -296,8 +252,6 @@ def main():
             run_benchmarks(batch_size, steps, topk, num_draft_tokens)
             kill_process_tree(process.pid)
             process.wait()
-
-    compute_speedup_and_acceptance_rate(results)
 
     os.makedirs(args.output_dir, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")

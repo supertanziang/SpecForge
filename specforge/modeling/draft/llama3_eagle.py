@@ -1326,15 +1326,6 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         )
         self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
 
-        if hasattr(config, "target_hidden_size"):
-            self.fc = torch.nn.Linear(
-                config.target_hidden_size * 3, config.hidden_size, bias=False
-            )
-        else:
-            self.fc = torch.nn.Linear(
-                config.hidden_size * 3, config.hidden_size, bias=False
-            )
-
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(
             config.hidden_size, config.draft_vocab_size, bias=False
@@ -1355,7 +1346,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
     ):
         """
         Arguments:
-            hidden_states (`torch.FloatTensor`): input to the layer, cat low, mid high hidden_states of shape `(batch, seq_len, hidden_states * 3)`
+            hidden_states (`torch.FloatTensor`): hidden states from the top layer of the target model, shape `(batch, seq_len, hidden_size)`
             input_ids (`torch.LongTensor`): input ids of shape `(batch, seq_len)`
             attention_mask (`torch.FloatTensor`): attention mask of size
                 `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
@@ -1384,8 +1375,6 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask, (batch_size, seq_length), hidden_states, 0
         )
 
-        # fc
-        hidden_states = self.fc(hidden_states)
         hidden_states = self.midlayer(
             input_emb=inputs_embeds,
             hidden_states=hidden_states,
@@ -1406,9 +1395,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return self.embed_tokens(input_ids)
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # eagle 3 requires hidden states from 3 layers
-        assert hidden_states.size(-1) == self.config.hidden_size * 3
-        return self.fc(hidden_states)
+        return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         norm_hidden_states = self.norm(hidden_states)

@@ -5,23 +5,22 @@ export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 # train eagle3 for llama3.1-8b
 NUM_GPUS=${1:-1}
 TP_SIZE=${2:-1}
-BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-128}
+BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-64}
 
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-
 
 torchrun \
     --standalone \
     --nproc_per_node $NUM_GPUS \
     $ROOT_DIR/scripts/train_eagle3.py \
-    --target-model-path /prj/corp/crd/morpheus/lasvegas/china-scratch/ziantan/EAGLE/hub/Meta-Llama-3.1-8B-Instruct \
+    --target-model-path  /prj/corp/crd/morpheus/lasvegas/china-scratch/ziantan/EAGLE/hub/Meta-Llama-3.1-8B-Instruct \
     --draft-model-config $ROOT_DIR/configs/llama3-8B-eagle3.json \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
-    --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3-sharegpt \
-    --num-epochs 15 \
-    --batch-size 3 \
+    --output-dir $ROOT_DIR/outputs/llama3-8b-eagle3-sharegpt_onlyhighfeature \
+    --num-epochs 10 \
+    --batch-size 4 \
     --tp-size $TP_SIZE \
     --learning-rate 1e-4 \
     --max-length 2048 \

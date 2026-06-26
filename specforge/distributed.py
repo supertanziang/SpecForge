@@ -1,6 +1,8 @@
 from datetime import timedelta
 from typing import Any, Optional
 
+import os
+
 import torch
 import torch.distributed as dist
 from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
@@ -73,7 +75,16 @@ def init_distributed(
         tp_size(int): The degree of tensor parallelism
     """
     dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
-    local_rank = dist.get_rank() % torch.cuda.device_count()
+    # When SPECFORGE_PER_RANK_DEVICES is set, each rank has already had its
+    # CUDA_VISIBLE_DEVICES re-sliced (in train_dflash.py) so it only sees its
+    # own N GPUs as cuda:0..cuda:N-1. In that case every rank must bind to
+    # cuda:0 (the first card of its own slice) — using the global rank modulo
+    # device_count would push e.g. rank 1 onto cuda:1, colliding with its own
+    # balanced device_map target shard and causing OOM.
+    if os.environ.get("SPECFORGE_PER_RANK_DEVICES"):
+        local_rank = 0
+    else:
+        local_rank = dist.get_rank() % torch.cuda.device_count()
     torch.cuda.set_device(local_rank)
     print_with_rank(f"bind to device {local_rank}")
 

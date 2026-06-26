@@ -1,10 +1,13 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import inspect
+import os
 from typing import List, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from PIL import Image
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -56,6 +59,7 @@ class DFlashTargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        image_file: Optional[str] = None,
     ) -> DFlashTargetOutput:
         """Generate context hidden states for DFlash training."""
 
@@ -186,6 +190,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        image_file: Optional[str] = None,
     ) -> DFlashTargetOutput:
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
         reqs, data_cache = [], []
@@ -226,9 +231,11 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
 
 
 class HFDFlashTargetModel(DFlashTargetModel):
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, is_vlm: bool = False, processor=None):
         super().__init__()
         self.model = model
+        self.is_vlm = is_vlm
+        self.processor = processor
 
     @classmethod
     def from_pretrained(
@@ -238,22 +245,55 @@ class HFDFlashTargetModel(DFlashTargetModel):
         device: str = None,
         cache_dir: Optional[str] = None,
         trust_remote_code: bool = True,
+        is_vlm: bool = False,
+        processor=None,
         **kwargs,
     ) -> "HFDFlashTargetModel":
 
-        target_model = AutoModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path,
-            torch_dtype=torch_dtype,
-            cache_dir=cache_dir,
-            output_hidden_states=True,
-            trust_remote_code=trust_remote_code,
-            **kwargs,
-        ).eval()
+        if is_vlm:
+            # VLM target (e.g. Qwen2.5-VL, Qwen3.5-VL): load the image-text-to-text
+            # model so the vision tower runs and image features get injected into the
+            # hidden states. AutoModelForImageTextToText resolves the right class from
+            # the model config (Qwen2_5_VLForConditionalGeneration /
+            # Qwen3_5MoeForConditionalGeneration / ...), so this stays model-agnostic.
+            from transformers import AutoModelForImageTextToText
 
-        if device:
+            # Optional accelerate-style sharding within this rank (e.g. 35B-VL spans
+            # multiple GPUs per training rank). When SPECFORGE_TARGET_DEVICE_MAP is
+            # set, we hand it to from_pretrained and skip the explicit .to(device)
+            # below — accelerate has already placed every shard.
+            device_map_env = os.environ.get("SPECFORGE_TARGET_DEVICE_MAP")
+            extra_kwargs = dict(kwargs)
+            sharded = False
+            if device_map_env:
+                # device_map="auto"/"balanced"/"sequential": accelerate picks placement
+                # from CUDA_VISIBLE_DEVICES (the launcher restricts each rank to its
+                # own slice of physical GPUs).
+                extra_kwargs["device_map"] = device_map_env
+                sharded = True
+
+            target_model = AutoModelForImageTextToText.from_pretrained(
+                pretrained_model_name_or_path,
+                torch_dtype=torch_dtype,
+                cache_dir=cache_dir,
+                trust_remote_code=trust_remote_code,
+                **extra_kwargs,
+            ).eval()
+        else:
+            target_model = AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path,
+                torch_dtype=torch_dtype,
+                cache_dir=cache_dir,
+                output_hidden_states=True,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            ).eval()
+            sharded = False
+
+        if device and not sharded:
             target_model = target_model.to(device)
 
-        return cls(target_model)
+        return cls(target_model, is_vlm=is_vlm, processor=processor)
 
     @torch.no_grad()
     def generate_dflash_data(
@@ -261,23 +301,63 @@ class HFDFlashTargetModel(DFlashTargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        image_file: Optional[str] = None,
     ) -> DFlashTargetOutput:
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "output_hidden_states": True,
+            "use_cache": False,
+        }
+
+        if self.is_vlm and image_file is not None:
+            # input_ids already contains the expanded image placeholder tokens
+            # (produced offline). We only need the vision features here, so run the
+            # image_processor alone (no second text/image expansion). Mirrors ViSpec's
+            # build_target_hidden.
+            #
+            # When image_file is None (plain-text sample fed to a VLM target via
+            # --vlm-text-data), we skip vision processing entirely: Qwen2.5-VL's
+            # forward runs text-only when pixel_values/image_grid_thw are absent.
+            assert self.processor is not None, "VLM target requires a processor"
+            image = Image.open(image_file).convert("RGB")
+            img_proc = self.processor.image_processor(
+                images=[image], return_tensors="pt"
+            ).to(input_ids.device)
+            if "pixel_values" in img_proc:
+                model_inputs["pixel_values"] = img_proc["pixel_values"]
+            if "image_grid_thw" in img_proc:
+                model_inputs["image_grid_thw"] = img_proc["image_grid_thw"]
+
+            # Qwen3.5-VL (Qwen3_5MoeForConditionalGeneration) requires mm_token_type_ids
+            # for M-RoPE: 0=text, 1=image, 2=video. transformers>=5.8 raises if missing.
+            # Older Qwen2.5-VL forward doesn't accept this kwarg; gate by signature.
+            forward_params = inspect.signature(self.model.forward).parameters
+            if "mm_token_type_ids" in forward_params:
+                cfg = self.model.config
+                image_token_id = getattr(cfg, "image_token_id", None)
+                video_token_id = getattr(cfg, "video_token_id", None)
+                mm_ids = torch.zeros_like(input_ids, dtype=torch.int32)
+                if image_token_id is not None:
+                    mm_ids[input_ids == image_token_id] = 1
+                if video_token_id is not None:
+                    mm_ids[input_ids == video_token_id] = 2
+                model_inputs["mm_token_type_ids"] = mm_ids
+
+        outputs = self.model(**model_inputs)
 
         # hidden_states[0] = embedding output; hidden_states[i+1] = layer i output
         offset = 1
         selected = []
         if self.capture_layer_ids is not None:
             for idx in self.capture_layer_ids:
-                selected.append(outputs.hidden_states[idx + offset])
+                # accelerate device_map can place layers on different GPUs;
+                # bring all captured hidden_states back to the input device
+                # before concatenation.
+                selected.append(outputs.hidden_states[idx + offset].to(input_ids.device))
             hidden_states = torch.cat(selected, dim=-1)
         else:
-            hidden_states = outputs.hidden_states[-1]
+            hidden_states = outputs.hidden_states[-1].to(input_ids.device)
 
         return DFlashTargetOutput(
             hidden_states=hidden_states,
@@ -296,6 +376,14 @@ def get_dflash_target_model(
     **kwargs,
 ) -> DFlashTargetModel:
     if backend == "sglang":
+        if kwargs.get("is_vlm", False):
+            raise ValueError(
+                "VLM target is only supported with the 'hf' backend; "
+                "the sglang DFlash backend does not return image-aware hidden states."
+            )
+        # sglang backend does not accept these hf-only kwargs
+        kwargs.pop("is_vlm", None)
+        kwargs.pop("processor", None)
         return SGLangDFlashTargetModel.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             torch_dtype=torch_dtype,

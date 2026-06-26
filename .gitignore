@@ -196,6 +196,7 @@ outputs/
 wandb/
 .idea
 .vscode/
-
+model/
+logs/
 # macOS
 .DS_Store

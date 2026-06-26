@@ -624,28 +624,44 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             seq_length_with_past = seq_length_with_past + past_key_values_length
 
         if position_ids is None:
-            attention_mask_tensor = (
-                attention_mask
-                if not isinstance(attention_mask, dict)
-                else attention_mask["full_attention"]
-            )
-            if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
-                attention_mask_tensor = torch.diagonal(
-                    attention_mask_tensor[:, 0], dim1=1, dim2=2
+            if image_grid_thw is None:
+                # 纯文本(--vlm-text-data, 无图): 不需要 mrope, position 就是标准 1D 顺序位置。
+                # 直接 arange 既正确又绕开 get_rope_index(新版 transformers 要求必传
+                # mm_token_type_ids, 纯文本场景没有该字段会崩)。
+                position_ids = (
+                    torch.arange(seq_length, device=hidden_states.device)
+                    .unsqueeze(0)
+                    .expand(batch_size, -1)
                 )
+            else:
                 attention_mask_tensor = (
-                    attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+                    attention_mask
+                    if not isinstance(attention_mask, dict)
+                    else attention_mask["full_attention"]
                 )
-                attention_mask_tensor = (1.0 - attention_mask_tensor).int()
+                if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
+                    attention_mask_tensor = torch.diagonal(
+                        attention_mask_tensor[:, 0], dim1=1, dim2=2
+                    )
+                    attention_mask_tensor = (
+                        attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+                    )
+                    attention_mask_tensor = (1.0 - attention_mask_tensor).int()
 
-            position_ids, rope_deltas = self.target_model.model.get_rope_index(
-                input_ids,
-                image_grid_thw,
-                None,
-                second_per_grid_ts=None,
-                attention_mask=attention_mask_tensor,
-            )
-            self.rope_deltas = rope_deltas
+                position_ids, rope_deltas = self.target_model.model.get_rope_index(
+                    input_ids,
+                    image_grid_thw,
+                    None,
+                    second_per_grid_ts=None,
+                    attention_mask=attention_mask_tensor,
+                )
+                self.rope_deltas = rope_deltas
+                # VLM target 返回 3D mrope position_ids [3, batch, seq]，但 draft 端用
+                # 1D rope（不用 mrope），取第 0 维（temporal）降成 1D [batch, seq]。
+                # 对纯文本 token 三维相同所以无损；对图像 token 取 temporal 是标准做法
+                # （与 vLLM llm_base_proposer._set_positions 的 positions=positions[0] 对齐）。
+                if position_ids.ndim == 3:
+                    position_ids = position_ids[0]
         else:
             position_ids = position_ids
 

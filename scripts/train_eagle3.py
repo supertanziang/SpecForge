@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import json as _json
 import math
 import os
 import time
@@ -133,6 +134,27 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     # dataset arguments
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
+    dataset_group.add_argument(
+        "--vlm-online-mm",
+        action="store_true",
+        help="VLM only: 用 dflash 同款 tokenized jsonl ({input_ids, loss_mask, image_file}), "
+             "在 dataloader worker 里 Image.open + processor 现算 pixel_values。"
+             "绕开 build_eagle3_dataset 的 HF datasets Map fork 死锁, 不预缓存 pixel_values "
+             "(避免 ~750GB 磁盘 + 5 小时离线预处理)。",
+    )
+    dataset_group.add_argument(
+        "--vocab-mapping-path",
+        type=str,
+        default=None,
+        help="vlm-online-mm 模式下用预先生成好的 vocab_mapping (per-token frequency 直接扫 jsonl 算)。",
+    )
+    dataset_group.add_argument(
+        "--vlm-text-data",
+        action="store_true",
+        help="VLM target (--is-vlm) 但喂纯文本 ShareGPT conversations(无图)。走 build_eagle3_dataset "
+        "在线 tokenize(is_vlm=False 数据分支), target forward 在 pixel_values=None 时退化为纯文本。"
+        "对标 dflash 的同名 flag。",
+    )
     dataset_group.add_argument("--train-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
@@ -351,16 +373,25 @@ def build_target_model(
             )
 
         # set the aux hidden states layers
-        if (
-            hasattr(draft_model_config, "eagle_config")
-            and draft_model_config.eagle_config is not None
-            and "eagle_aux_hidden_state_layer_ids" in draft_model_config.eagle_config
-        ):
-            target_model.set_aux_hidden_states_layers(
-                draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
-            )
-        else:
-            target_model.set_aux_hidden_states_layers()
+        # 注: VLM custom 分支 (上面的 Qwen2_5_VLForConditionalGeneration) 是裸 HF 模型,
+        # 没有 set_aux_hidden_states_layers; QwenVLOnlineEagle3Model 内部自己抽 layer
+        # (low/mid/last 三层), 不需要外部 set。
+        is_vlm_custom = (
+            args.is_vlm
+            and draft_model_config.target_model_type == "qwen2_5_vl"
+            and args.target_model_backend == "custom"
+        )
+        if not is_vlm_custom:
+            if (
+                hasattr(draft_model_config, "eagle_config")
+                and draft_model_config.eagle_config is not None
+                and "eagle_aux_hidden_state_layer_ids" in draft_model_config.eagle_config
+            ):
+                target_model.set_aux_hidden_states_layers(
+                    draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
+                )
+            else:
+                target_model.set_aux_hidden_states_layers()
 
         if args.is_vlm:
             processor = AutoProcessor.from_pretrained(
@@ -500,6 +531,39 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     return draft_model_config, draft_model, ckpt_info, resume_state
 
 
+def _vlm_aware_generator(file_path: str):
+    """从 jsonl 一次性读出 conversations + image (绝对路径)。
+    与 safe_conversations_generator 行为对齐 (list/dict 字段序列化为字符串以兼容 Arrow),
+    但额外透传 image 字段——specforge.data.preprocessing.preprocess_vlm_conversations
+    直接读 examples['image']。"""
+    with open(file_path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = _json.loads(line)
+            except _json.JSONDecodeError:
+                continue
+            convs = row.get("conversations", [])
+            if not isinstance(convs, list) or not convs:
+                continue
+            cleaned = []
+            for msg in convs:
+                if not isinstance(msg, dict):
+                    continue
+                cleaned.append(
+                    {
+                        k: (_json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v)
+                        for k, v in msg.items()
+                    }
+                )
+            out = {"conversations": cleaned}
+            if "image" in row:
+                out["image"] = row["image"]
+            yield out
+
+
 def build_dataloaders(
     args: Namespace,
     draft_model_config: AutoDraftModelConfig,
@@ -518,12 +582,52 @@ def build_dataloaders(
         f"{args.target_model_path}"  # Tokenizer may also different
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    train_dataset = Dataset.from_generator(
-        generator=safe_conversations_generator,
-        gen_kwargs={"file_path": args.train_data_path},
-    )
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
+    )
+
+    # 数据侧的 VLM 判定: --vlm-text-data 时 target 虽是 VLM, 但数据是纯文本 conversations
+    # (无图), 数据加载/collate 必须走非 VLM 路径(在线 tokenize + 非 VLM collator), 否则
+    # _vlm_aware_generator / preprocess_vlm_conversations / VlmDataCollator 会硬索引 image。
+    data_is_vlm = args.is_vlm and not args.vlm_text_data
+
+    # ============================================================================
+    # VLM 在线 MM 路径: 复用 dflash 的 tokenized jsonl, dataloader worker 里现算
+    # pixel_values。不走 build_eagle3_dataset (绕开 fork 死锁), 不预缓存 pixel_values
+    # (避免 ~750GB 磁盘)。
+    # ============================================================================
+    if args.is_vlm and args.vlm_online_mm:
+        from specforge.data.online_mm_dataset import OnlineMMDataset
+        from specforge.data.eagle3_online_mm import prepare_eagle3_mm_dataloader
+
+        train_eagle3_dataset = OnlineMMDataset(
+            args.train_data_path, max_len=args.max_length
+        )
+        if args.vocab_mapping_path is None:
+            raise ValueError(
+                "--vlm-online-mm 模式必须传 --vocab-mapping-path "
+                "(由 scripts/build_vocab_mapping_for_dflash_jsonl.py 离线生成)"
+            )
+        if not os.path.exists(args.vocab_mapping_path):
+            raise FileNotFoundError(args.vocab_mapping_path)
+        print_on_rank0(
+            f"[vlm-online-mm] dataset size={len(train_eagle3_dataset)}, "
+            f"vocab_mapping={args.vocab_mapping_path}"
+        )
+
+        train_dataloader = prepare_eagle3_mm_dataloader(
+            train_eagle3_dataset,
+            processor=processor,
+            max_length=args.max_length,
+            num_workers=args.dataloader_num_workers,
+            shuffle=True,
+            process_group=get_dp_group(),
+        )
+        return train_dataloader, args.vocab_mapping_path, None
+
+    train_dataset = Dataset.from_generator(
+        generator=_vlm_aware_generator if data_is_vlm else safe_conversations_generator,
+        gen_kwargs={"file_path": args.train_data_path},
     )
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
@@ -533,7 +637,7 @@ def build_dataloaders(
             max_length=args.max_length,
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
-            is_vlm=args.is_vlm,
+            is_vlm=data_is_vlm,
             is_preformatted=args.is_preformatted,
             processor=processor,
             num_proc=args.build_dataset_num_proc,
@@ -565,12 +669,12 @@ def build_dataloaders(
             if args.attention_backend == "usp" and not is_online
             else get_dp_group()
         ),
-        is_vlm=args.is_vlm,
+        is_vlm=data_is_vlm,
     )
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
             eval_dataset = Dataset.from_generator(
-                generator=safe_conversations_generator,
+                generator=_vlm_aware_generator if data_is_vlm else safe_conversations_generator,
                 gen_kwargs={"file_path": args.eval_data_path},
             )
             eval_eagle3_dataset = build_eagle3_dataset(
@@ -578,7 +682,7 @@ def build_dataloaders(
                 tokenizer,
                 args.chat_template,
                 args.max_length,
-                is_vlm=args.is_vlm,
+                is_vlm=data_is_vlm,
                 processor=processor,
                 num_proc=args.build_dataset_num_proc,
                 is_preformatted=args.is_preformatted,
@@ -601,7 +705,7 @@ def build_dataloaders(
                 if args.attention_backend == "usp" and not is_online
                 else get_dp_group()
             ),
-            is_vlm=args.is_vlm,
+            is_vlm=data_is_vlm,
         )
         print_with_rank("Initialized eval dataloader")
     else:
@@ -638,6 +742,12 @@ def save_checkpoints(
             for k, v in model_state_dict.items()
             if "draft_model." in k and "embed" not in k.lower()
         }
+        # SpecForge 训练端 draft 的单层叫 midlayer,但推理引擎 (vLLM/SGLang) 期望
+        # 标准 LlamaModel 的 layers.0。在保存时统一 rename,让 ckpt 两端都能直接加载。
+        draft_model_state_dict = {
+            k.replace("midlayer.", "layers.0."): v
+            for k, v in draft_model_state_dict.items()
+        }
 
         if dist.get_rank() == 0:
             torch.save(
@@ -670,7 +780,8 @@ def run_forward(
     List[torch.Tensor],
     List[torch.Tensor],
 ]:
-    if args.is_vlm and args.target_model_backend == "custom":
+    if args.is_vlm and not args.vlm_text_data and args.target_model_backend == "custom":
+        # 带图: QwenVLOnlineEagle3Model 吃 pixel_values/image_grid_thw
         (
             plosses,
             acceptance_rates,
@@ -685,6 +796,22 @@ def run_forward(
             loss_mask=data["loss_mask"].cuda(),
             pixel_values=data["pixel_values"].cuda(),
             image_grid_thw=data["image_grid_thw"].cuda(),
+        )
+    elif args.is_vlm and args.vlm_text_data and args.target_model_backend == "custom":
+        # VL target 喂纯文本(--vlm-text-data): 不传 pixel_values/image_grid_thw, 让
+        # QwenVLOnlineEagle3Model.forward 走默认 None, target forward 退化为纯文本。
+        (
+            plosses,
+            acceptance_rates,
+            acces,
+            acc_corrects,
+            acc_denoms,
+            metric_losses,
+            metric_loss_denoms,
+        ) = eagle3_model(
+            input_ids=data["input_ids"].cuda(),
+            attention_mask=data["attention_mask"].cuda(),
+            loss_mask=data["loss_mask"].cuda(),
         )
     else:
         image_grid_thw = None
@@ -1276,12 +1403,11 @@ def main():
 
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
-    # Save final checkpoint if training ended without saving
-    if global_step % args.save_interval != 0:
-        print_on_rank0(
-            f"Training completed at step {global_step}, saving final checkpoint..."
-        )
-        save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+    # Always save final checkpoint at the end of training, regardless of step count
+    print_on_rank0(
+        f"Training completed at step {global_step}, saving final checkpoint..."
+    )
+    save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
 
     # Close the tracker
     tracker.close()

@@ -12,6 +12,28 @@ import time
 import warnings
 from typing import Optional, Tuple
 
+# Per-rank GPU slicing: when SPECFORGE_PER_RANK_DEVICES is set (e.g. 2 means each
+# torchrun rank gets 2 physical GPUs out of CUDA_VISIBLE_DEVICES), re-slice
+# CUDA_VISIBLE_DEVICES BEFORE importing torch so each rank only sees its own
+# GPUs as cuda:0..cuda:N-1. Used for VLM target sharding via device_map.
+_per_rank = os.environ.get("SPECFORGE_PER_RANK_DEVICES")
+if _per_rank:
+    _per_rank_n = int(_per_rank)
+    _local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    _visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if _visible is None:
+        _all_devs = [str(i) for i in range(_per_rank_n * int(os.environ.get("WORLD_SIZE", "1")))]
+    else:
+        _all_devs = [d.strip() for d in _visible.split(",") if d.strip()]
+    _start = _local_rank * _per_rank_n
+    _slice = _all_devs[_start : _start + _per_rank_n]
+    assert len(_slice) == _per_rank_n, (
+        f"SPECFORGE_PER_RANK_DEVICES={_per_rank_n} but only {len(_slice)} GPUs left "
+        f"for local_rank={_local_rank} (visible={_all_devs})"
+    )
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(_slice)
+    print(f"[per-rank-slice] LOCAL_RANK={_local_rank} -> CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}", flush=True)
+
 import torch
 import torch.distributed as dist
 from accelerate.utils import set_seed
@@ -21,12 +43,13 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictTy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from datasets import load_dataset
 from specforge.args import SGLangBackendArgs, TrackerArgs
 from specforge.core.dflash import OnlineDFlashModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
+from specforge.data.online_mm_dataset import OnlineMMDataset, prepare_mm_dataloader
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.target.dflash_target_model import (
@@ -110,6 +133,39 @@ def parse_args():
         default=int(os.environ.get("SPECFORGE_DATA_NUM_PROC", 8)),
     )
 
+    vlm_group = parser.add_argument_group("vlm")
+    vlm_group.add_argument(
+        "--is-vlm",
+        action="store_true",
+        help="Train against a VLM target (e.g. Qwen2.5-VL). Uses a pre-tokenized "
+        "JSONL with input_ids/loss_mask/image_file and an HF VLM backend.",
+    )
+    vlm_group.add_argument(
+        "--vlm-text-data",
+        action="store_true",
+        help="VLM target (--is-vlm) but feed plain-text ShareGPT conversations "
+        "(no images). Routes to build_eagle3_dataset online tokenization instead "
+        "of the pre-tokenized OnlineMMDataset. Target forward degrades to text-only "
+        "when no image_file is present, so image samples still work if mixed in.",
+    )
+    vlm_group.add_argument(
+        "--min-pixels",
+        type=int,
+        default=None,
+        help="Processor min_pixels (e.g. 256*28*28 for Qwen2.5-VL). MUST match the "
+        "value used when the ViSpec full_ids were generated, else the recomputed "
+        "image_grid_thw will disagree with the baked-in image placeholder tokens and "
+        "forward will crash. Leave unset for processors that don't accept min_pixels "
+        "(e.g. Qwen3VLProcessor, which uses size={longest_edge,shortest_edge}).",
+    )
+    vlm_group.add_argument(
+        "--max-pixels",
+        type=int,
+        default=None,
+        help="Processor max_pixels (e.g. 1280*28*28 for Qwen2.5-VL). Must match ViSpec "
+        "generation. Leave unset for processors that don't accept max_pixels.",
+    )
+
     training_group = parser.add_argument_group("training")
     training_group.add_argument("--num-epochs", type=int, default=6)
     training_group.add_argument("--batch-size", type=int, default=1)
@@ -120,6 +176,16 @@ def parse_args():
     training_group.add_argument("--accumulation-steps", type=int, default=1)
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
+    training_group.add_argument(
+        "--init-draft-path",
+        type=str,
+        default=None,
+        help="Path to a draft checkpoint to initialize weights from (e.g. a stage1 "
+        "checkpoint), WITHOUT resuming optimizer/scheduler/step state. Use this for "
+        "stage2 training in a fresh --output-dir that continues from stage1 weights. "
+        "Ignored when --resume finds a checkpoint in --output-dir (resuming the "
+        "current run takes precedence).",
+    )
 
     output_group = parser.add_argument_group("output")
     output_group.add_argument("--output-dir", type=str, required=True)
@@ -149,7 +215,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
+def build_models(args, processor=None) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     """Build target model (backend wrapper) and draft model."""
     print_on_rank0(
         f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
@@ -158,6 +224,12 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     target_model_kwargs = {}
     if args.target_model_backend == "sglang":
         target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+
+    if args.is_vlm:
+        if args.target_model_backend != "hf":
+            raise ValueError("--is-vlm requires --target-model-backend hf")
+        target_model_kwargs["is_vlm"] = True
+        target_model_kwargs["processor"] = processor
 
     target_model = get_dflash_target_model(
         pretrained_model_name_or_path=args.target_model_path,
@@ -213,6 +285,30 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
 def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
     """Build train and eval dataloaders."""
     import hashlib
+
+    if args.is_vlm and not args.vlm_text_data:
+        # VLM path: pre-tokenized JSONL (input_ids / loss_mask / image_file), bs=1.
+        # Target hidden states are computed online in the training loop.
+        train_mm_dataset = OnlineMMDataset(args.train_data_path, max_len=args.max_length)
+        print_on_rank0(f"Loaded VLM train dataset: {len(train_mm_dataset)} samples")
+        train_dataloader = prepare_mm_dataloader(
+            train_mm_dataset,
+            num_workers=args.dataloader_num_workers,
+            shuffle=True,
+            process_group=get_dp_group(),
+        )
+        eval_dataloader = None
+        if args.eval_data_path:
+            eval_mm_dataset = OnlineMMDataset(
+                args.eval_data_path, max_len=args.max_length
+            )
+            eval_dataloader = prepare_mm_dataloader(
+                eval_mm_dataset,
+                num_workers=args.dataloader_num_workers,
+                shuffle=False,
+                process_group=get_dp_group(),
+            )
+        return train_dataloader, eval_dataloader
 
     cache_params_string = (
         f"{args.train_data_path}-"
@@ -376,7 +472,26 @@ def main():
             print(f"Loading draft config from checkpoint: {checkpoint_config_path}")
             args.draft_config_path = checkpoint_config_path
 
-    target_model, draft_model = build_models(args)
+    # Build processor (VLM) / tokenizer up front; target model needs the processor.
+    processor = None
+    if args.is_vlm:
+        # Only pass min/max_pixels when explicitly set: Qwen2.5-VL's processor accepts
+        # them, but Qwen3VLProcessor does not (it uses size={longest_edge,shortest_edge}).
+        processor_kwargs = {}
+        if args.min_pixels is not None:
+            processor_kwargs["min_pixels"] = args.min_pixels
+        if args.max_pixels is not None:
+            processor_kwargs["max_pixels"] = args.max_pixels
+        processor = AutoProcessor.from_pretrained(
+            args.target_model_path,
+            trust_remote_code=args.trust_remote_code,
+            **processor_kwargs,
+        )
+        tokenizer = processor.tokenizer
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+
+    target_model, draft_model = build_models(args, processor=processor)
 
     resume_state = None
     if draft_model_last_checkpoint:
@@ -398,11 +513,28 @@ def main():
                 f"Will resume from epoch {resume_state['epoch']}, "
                 f"step {resume_state['global_step']}"
             )
-
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+    elif args.init_draft_path:
+        # stage2: initialize draft weights from a stage1 checkpoint WITHOUT resuming
+        # optimizer/scheduler/step state (resume_state stays None, output-dir is fresh).
+        loaded_model = DFlashDraftModel.from_pretrained(
+            args.init_draft_path, torch_dtype=torch.bfloat16
+        )
+        draft_model.load_state_dict(loaded_model.state_dict())
+        del loaded_model
+        print(
+            f"Initialized draft weights from {args.init_draft_path} "
+            "(fresh optimizer/scheduler/step)"
+        )
 
     if args.mask_token_id is not None:
         mask_token_id = args.mask_token_id
+    elif args.is_vlm:
+        # VLM target embeddings are frozen and not resized; auto-adding a MASK token
+        # would yield an out-of-range id. Require an explicit free-slot token id.
+        raise ValueError(
+            "--is-vlm requires an explicit --mask-token-id (< vocab_size, a free "
+            "embedding slot, e.g. 151657 for Qwen2.5-VL)."
+        )
     elif tokenizer.mask_token_id is not None:
         mask_token_id = tokenizer.mask_token_id
     else:
@@ -525,18 +657,42 @@ def main():
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
+
+            _prof = os.environ.get("SPECFORGE_PROFILE_STEPS")
+            _do_prof = _prof and global_step <= int(_prof) and dist.get_rank() == 0
+            if _do_prof:
+                torch.cuda.synchronize()
+                _t0 = time.time()
             target_output = target_model.generate_dflash_data(
-                input_ids, attention_mask, loss_mask
+                input_ids,
+                attention_mask,
+                loss_mask,
+                image_file=data.get("image_file") if args.is_vlm else None,
             )
             hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
+            if _do_prof:
+                torch.cuda.synchronize()
+                _t1 = time.time()
 
             loss, accuracy = dflash_model(
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
             )
+            if _do_prof:
+                torch.cuda.synchronize()
+                _t2 = time.time()
 
             (loss / args.accumulation_steps).backward()
+            if _do_prof:
+                torch.cuda.synchronize()
+                _t3 = time.time()
+                print(
+                    f"[profile] step={global_step} target_fwd={_t1-_t0:.3f}s "
+                    f"draft_fwd+loss={_t2-_t1:.3f}s backward={_t3-_t2:.3f}s "
+                    f"total={_t3-_t0:.3f}s",
+                    flush=True,
+                )
 
             if global_step % args.accumulation_steps == 0:
                 optimizer.step()

@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from specforge.modeling.draft.dflash import DFlashDraftModel
 
@@ -106,6 +107,7 @@ class OnlineDFlashModel(nn.Module):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
+        lm_head_chunk_size: Optional[int] = 512,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -116,6 +118,10 @@ class OnlineDFlashModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        # Chunk size (in rows) for the lm_head + cross-entropy pass. The full
+        # logits tensor over ~248k vocab is multi-GiB; chunking caps the peak.
+        # None means no chunking (dense path).
+        self.lm_head_chunk_size = lm_head_chunk_size
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -259,7 +265,11 @@ class OnlineDFlashModel(nn.Module):
             attention_mask=dflash_attn_mask,
         )
 
-        logits = self.lm_head(output_hidden)
+        # NOTE: we intentionally do NOT materialize the full logits tensor here.
+        # lm_head projects to the full vocab (~248k); for N anchor*block rows this
+        # is a multi-GiB tensor (plus its grad) and was the single largest memory
+        # spike, blocking single-card target placement. We chunk the lm_head +
+        # cross-entropy over rows below (numerically identical to the dense path).
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
         label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
@@ -299,20 +309,58 @@ class OnlineDFlashModel(nn.Module):
             )
             weight_mask = weight_mask * decay_weights
 
-        # --- Cross entropy ---
-        flat_logits = logits.view(-1, logits.size(-1))
-        flat_targets = target_ids.view(-1)
-        flat_weights = weight_mask.view(-1)
+        # --- Chunked lm_head + cross entropy (memory-efficient) ---
+        flat_hidden = output_hidden.reshape(-1, output_hidden.size(-1))
+        flat_targets = target_ids.reshape(-1)
+        flat_weights = weight_mask.reshape(-1)
 
-        loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+        num_rows = flat_hidden.size(0)
+        chunk_size = self.lm_head_chunk_size or num_rows
+
+        def _chunk_loss(hidden_chunk, target_chunk, weight_chunk):
+            # Recomputed under activation checkpointing: the (rows x vocab) logits
+            # tensor is never kept for backward, only re-formed transiently. This
+            # is what actually caps the peak — a plain chunked loop still retains
+            # every chunk's logits in the autograd graph until backward.
+            chunk_logits = self.lm_head(hidden_chunk)
+            chunk_loss = F.cross_entropy(
+                chunk_logits, target_chunk, reduction="none"
+            )
+            return (chunk_loss * weight_chunk).sum()
+
+        weighted_loss_sum = flat_hidden.new_zeros(())
+        correct_sum = flat_hidden.new_zeros(())
+        for start in range(0, num_rows, chunk_size):
+            end = min(start + chunk_size, num_rows)
+            hidden_chunk = flat_hidden[start:end]
+            target_chunk = flat_targets[start:end]
+            weight_chunk = flat_weights[start:end]
+            # Accuracy first, fully under no_grad, so its transient logits are
+            # freed before the grad-tracked loss pass allocates the next ones.
+            with torch.no_grad():
+                chunk_pred = torch.argmax(self.lm_head(hidden_chunk), dim=-1)
+                chunk_correct = (chunk_pred == target_chunk) & (
+                    binary_eval_mask[start:end] > 0.5
+                )
+                correct_sum = correct_sum + chunk_correct.sum().float()
+            if torch.is_grad_enabled() and hidden_chunk.requires_grad:
+                chunk_sum = checkpoint(
+                    _chunk_loss,
+                    hidden_chunk,
+                    target_chunk,
+                    weight_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                chunk_sum = _chunk_loss(hidden_chunk, target_chunk, weight_chunk)
+            weighted_loss_sum = weighted_loss_sum + chunk_sum
+
         valid_token_count = flat_weights.sum() + 1e-6
-        loss = (loss_per_token * flat_weights).sum() / valid_token_count
+        loss = weighted_loss_sum / valid_token_count
 
         # --- Accuracy ---
         with torch.no_grad():
-            pred_ids = torch.argmax(flat_logits, dim=-1)
-            correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
             actual_token_count = binary_eval_mask.sum() + 1e-6
-            accuracy = correct.sum().float() / actual_token_count
+            accuracy = correct_sum / actual_token_count
 
         return loss, accuracy

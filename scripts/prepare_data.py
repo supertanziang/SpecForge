@@ -65,7 +65,7 @@ def parse_args():
     parser.add_argument(
         "--output-path",
         type=str,
-        default=None,
+        default="/prj/corp/crd/morpheus/lasvegas/china-scratch/ziantan/SpecForge/datasets/train",
         help="The path to save the processed dataset, if not specified, the dataset will be saved in the cache/dataset/dataset_name directory of the root path",
     )
     parser.add_argument(

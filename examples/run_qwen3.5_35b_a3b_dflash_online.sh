@@ -35,7 +35,6 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     --report-to tensorboard \
     --target-model-backend sglang \
     --block-size 16 \
-    --num-anchors 512 \
     --sglang-mem-fraction-static 0.5 \
     --embedding-key model.language_model.embed_tokens.weight \
     --resume

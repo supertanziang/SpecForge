@@ -27,7 +27,7 @@ from .online_mm_dataset import OnlineMMDataset
 
 
 class Eagle3OnlineMMCollator:
-    """读取 OnlineMMDataset 产出的 {input_ids, loss_mask, image_file}, 现场算 pixel_values。
+    """读取 OnlineMMDataset 产出的 {input_ids, loss_mask, image_files}, 现场算 pixel_values。
 
     输出与 specforge.data.utils.VlmDataCollatorWithPadding 期望一致:
         {
@@ -35,9 +35,11 @@ class Eagle3OnlineMMCollator:
           "attention_mask": LongTensor[1, S],
           "loss_mask":      LongTensor[1, S],
           "pixel_values":   FloatTensor[N_patches, D],
-          "image_grid_thw": LongTensor[1, 3],
+          "image_grid_thw": LongTensor[N, 3],
         }
     bs=1 only (与 dflash 一致, 多模态 batch 内拼接成本不划算)。
+
+    image_files 为帧路径列表: 单图 = 1 元素, 视频 = N 帧(抽帧成多图, 与评测端一致)。
     """
 
     def __init__(self, processor, max_length: int = 4096):
@@ -50,13 +52,14 @@ class Eagle3OnlineMMCollator:
         f = features[0]
         input_ids = f["input_ids"][: self.max_length]
         loss_mask = f["loss_mask"][: self.max_length]
-        image_file = f["image_file"]
+        image_files = f["image_files"]
 
-        # 读图 + image processor 算 pixel_values / image_grid_thw
-        image = Image.open(image_file).convert("RGB")
-        image_inputs = self.image_processor(images=[image], return_tensors="pt")
+        # 读全部帧 + image processor 算 pixel_values / image_grid_thw([N,3])。
+        # 单图是 N=1 的特例; 视频多帧当多图处理(image_token), 不走 native video。
+        images = [Image.open(p).convert("RGB") for p in image_files]
+        image_inputs = self.image_processor(images=images, return_tensors="pt")
         pixel_values = image_inputs.pixel_values  # [N_patches, D]
-        image_grid_thw = image_inputs.image_grid_thw  # [1, 3]
+        image_grid_thw = image_inputs.image_grid_thw  # [N, 3]
 
         return {
             "input_ids": input_ids.unsqueeze(0).long(),  # [1, S]

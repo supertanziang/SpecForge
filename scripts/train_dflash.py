@@ -138,7 +138,7 @@ def parse_args():
         "--is-vlm",
         action="store_true",
         help="Train against a VLM target (e.g. Qwen2.5-VL). Uses a pre-tokenized "
-        "JSONL with input_ids/loss_mask/image_file and an HF VLM backend.",
+        "JSONL with input_ids/loss_mask/image_files and an HF VLM backend.",
     )
     vlm_group.add_argument(
         "--vlm-text-data",
@@ -146,7 +146,7 @@ def parse_args():
         help="VLM target (--is-vlm) but feed plain-text ShareGPT conversations "
         "(no images). Routes to build_eagle3_dataset online tokenization instead "
         "of the pre-tokenized OnlineMMDataset. Target forward degrades to text-only "
-        "when no image_file is present, so image samples still work if mixed in.",
+        "when no image_files are present, so image samples still work if mixed in.",
     )
     vlm_group.add_argument(
         "--min-pixels",
@@ -174,6 +174,14 @@ def parse_args():
     training_group.add_argument("--warmup-ratio", type=float, default=0.04)
     training_group.add_argument("--max-grad-norm", type=float, default=1.0)
     training_group.add_argument("--accumulation-steps", type=int, default=1)
+    training_group.add_argument(
+        "--freeze-draft-backbone",
+        action="store_true",
+        help="Freeze all draft params except video_adapter; train the adapter "
+        "only. Use for stage3 adapter warmup: a randomly-initialized resampler "
+        "otherwise corrupts the draft KV from step 1 and diverges the backbone "
+        "(loss -> NaN).",
+    )
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
     training_group.add_argument(
@@ -213,6 +221,13 @@ def parse_args():
     SGLangBackendArgs.add_args(sglang_group)
 
     return parser.parse_args()
+
+
+def _get_video_adapter_image_token_id(draft_model: DFlashDraftModel) -> Optional[int]:
+    """Extract image_token_id from video adapter config if enabled."""
+    if draft_model.video_adapter is not None:
+        return draft_model.video_adapter.image_token_id
+    return None
 
 
 def build_models(args, processor=None) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
@@ -287,7 +302,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     import hashlib
 
     if args.is_vlm and not args.vlm_text_data:
-        # VLM path: pre-tokenized JSONL (input_ids / loss_mask / image_file), bs=1.
+        # VLM path: pre-tokenized JSONL (input_ids / loss_mask / image_files), bs=1.
         # Target hidden states are computed online in the training loop.
         train_mm_dataset = OnlineMMDataset(args.train_data_path, max_len=args.max_length)
         print_on_rank0(f"Loaded VLM train dataset: {len(train_mm_dataset)} samples")
@@ -519,8 +534,20 @@ def main():
         loaded_model = DFlashDraftModel.from_pretrained(
             args.init_draft_path, torch_dtype=torch.bfloat16
         )
-        draft_model.load_state_dict(loaded_model.state_dict())
+        missing, unexpected = draft_model.load_state_dict(
+            loaded_model.state_dict(), strict=False
+        )
         del loaded_model
+        if missing:
+            print_on_rank0(
+                f"[init-draft] Missing keys (randomly initialized): "
+                f"{len(missing)} params, e.g. {missing[:3]}"
+            )
+        if unexpected:
+            print_on_rank0(
+                f"[init-draft] Unexpected keys (ignored): "
+                f"{len(unexpected)} params, e.g. {unexpected[:3]}"
+            )
         print(
             f"Initialized draft weights from {args.init_draft_path} "
             "(fresh optimizer/scheduler/step)"
@@ -571,7 +598,31 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
+        image_token_id=_get_video_adapter_image_token_id(draft_model),
     )
+
+    # Optionally freeze the draft backbone and train only the video adapter.
+    # Must run BEFORE the FSDP wrap so `requires_grad` is baked in: BF16Optimizer
+    # collects `[p for p in model.parameters() if p.requires_grad]`, so freezing
+    # here makes the optimizer automatically train the adapter alone. FSDP uses
+    # use_orig_params=True, which permits mixed requires_grad within a unit.
+    if args.freeze_draft_backbone:
+        if draft_model.video_adapter is None:
+            raise ValueError(
+                "--freeze-draft-backbone requires a video_adapter in the draft config"
+            )
+        for p in draft_model.parameters():
+            p.requires_grad = False
+        for p in draft_model.video_adapter.parameters():
+            p.requires_grad = True
+        n_train = sum(
+            p.numel() for p in draft_model.parameters() if p.requires_grad
+        )
+        n_total = sum(p.numel() for p in draft_model.parameters())
+        print_on_rank0(
+            f"[freeze] Training video_adapter only: "
+            f"{n_train:,} / {n_total:,} params trainable"
+        )
 
     # Wrap each transformer block as its own FSDP unit so that all-gather /
     # reduce-scatter overlap with compute. Without an auto_wrap_policy the
@@ -667,7 +718,7 @@ def main():
                 input_ids,
                 attention_mask,
                 loss_mask,
-                image_file=data.get("image_file") if args.is_vlm else None,
+                image_files=data.get("image_files") if args.is_vlm else None,
             )
             hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
             if _do_prof:
@@ -684,6 +735,14 @@ def main():
                 _t2 = time.time()
 
             (loss / args.accumulation_steps).backward()
+
+            # Debug aid for NCCL collective desync: when SPECFORGE_STEP_BARRIER=1,
+            # synchronize every rank right after backward so a structural mismatch
+            # (e.g. video adapter emitting a different number of collectives on one
+            # rank) surfaces at the exact offending step instead of as an opaque
+            # 30-min watchdog timeout later. Leave off for normal runs.
+            if os.environ.get("SPECFORGE_STEP_BARRIER") == "1":
+                dist.barrier()
             if _do_prof:
                 torch.cuda.synchronize()
                 _t3 = time.time()

@@ -268,6 +268,10 @@ def _build_vllm_cmd(
     # 大模型 (如 Qwen3.5-35B-A3B, 72GB) 单卡放不下时, 用张量并行跨多卡切分。
     if tensor_parallel_size > 1:
         cmd += ["--tensor-parallel-size", str(tensor_parallel_size)]
+        # 35B hybrid MoE + dflash speculative 在 TP>1 时, custom all-reduce 会触发
+        # 'illegal memory access' (custom_all_reduce.cuh:455) 把 SD server 打挂。
+        # 禁用 custom all-reduce, 回退到标准 NCCL all-reduce 绕开该 bug。
+        cmd += ["--disable-custom-all-reduce"]
     # 数据并行: 起 N 个 engine 副本 (每副本占 tensor_parallel_size 张卡), vLLM 自带
     # 负载均衡把并发请求分摊到各副本。总占卡数 = data_parallel_size * tensor_parallel_size。
     # 注意: DP 只有在「并发请求 >= 副本数」时才会让多卡都忙起来 (见 --concurrency)。

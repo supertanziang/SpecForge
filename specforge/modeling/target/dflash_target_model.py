@@ -31,6 +31,7 @@ class DFlashTargetOutput:
     input_ids: torch.Tensor  # [batch, seq_len]
     attention_mask: torch.Tensor  # [batch, seq_len]
     loss_mask: torch.Tensor  # [batch, seq_len]
+    visual_token_mask: Optional[torch.Tensor] = None  # [batch, seq_len], bool
 
 
 class DFlashTargetModel(ABC):
@@ -59,9 +60,13 @@ class DFlashTargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-        image_file: Optional[str] = None,
+        image_files: Optional[List[str]] = None,
     ) -> DFlashTargetOutput:
-        """Generate context hidden states for DFlash training."""
+        """Generate context hidden states for DFlash training.
+
+        image_files: list of frame paths (single image = 1-element list, video =
+        N frames). None for plain-text samples.
+        """
 
     def set_capture_layers(self, layer_ids: List[int]) -> None:
         """Set which layers' hidden states to capture."""
@@ -190,7 +195,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-        image_file: Optional[str] = None,
+        image_files: Optional[List[str]] = None,
     ) -> DFlashTargetOutput:
         sampling_params = SamplingParams(temperature=0, max_new_tokens=1)
         reqs, data_cache = [], []
@@ -301,7 +306,7 @@ class HFDFlashTargetModel(DFlashTargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
-        image_file: Optional[str] = None,
+        image_files: Optional[List[str]] = None,
     ) -> DFlashTargetOutput:
         model_inputs = {
             "input_ids": input_ids,
@@ -310,38 +315,62 @@ class HFDFlashTargetModel(DFlashTargetModel):
             "use_cache": False,
         }
 
-        if self.is_vlm and image_file is not None:
+        if self.is_vlm and image_files:
             # input_ids already contains the expanded image placeholder tokens
             # (produced offline). We only need the vision features here, so run the
             # image_processor alone (no second text/image expansion). Mirrors ViSpec's
             # build_target_hidden.
             #
-            # When image_file is None (plain-text sample fed to a VLM target via
+            # Video samples are stored as N extracted frames (image_files of len N);
+            # a single image is the N=1 case. We feed all frames to image_processor as
+            # a multi-image batch, matching how the eval side (benchmark_sd_vlm.py)
+            # treats a video: N independent image_url blocks, NOT a native video input.
+            # So pixel_values/image_grid_thw (shape [N,3]) use image_token_id throughout
+            # -- no video_token / pixel_values_videos / video_grid_thw involved.
+            #
+            # When image_files is empty/None (plain-text sample fed to a VLM target via
             # --vlm-text-data), we skip vision processing entirely: Qwen2.5-VL's
             # forward runs text-only when pixel_values/image_grid_thw are absent.
             assert self.processor is not None, "VLM target requires a processor"
-            image = Image.open(image_file).convert("RGB")
+            images = [Image.open(p).convert("RGB") for p in image_files]
             img_proc = self.processor.image_processor(
-                images=[image], return_tensors="pt"
+                images=images, return_tensors="pt"
             ).to(input_ids.device)
             if "pixel_values" in img_proc:
                 model_inputs["pixel_values"] = img_proc["pixel_values"]
             if "image_grid_thw" in img_proc:
                 model_inputs["image_grid_thw"] = img_proc["image_grid_thw"]
 
+            # Guard against offline/online tokenize mismatch: the number of image
+            # placeholder tokens in input_ids must equal the total vision tokens the
+            # processor emits for these frames (sum of grid t*h*w / merge_size^2).
+            # A mismatch (e.g. different min/max_pixels than at generation time, or
+            # wrong frame count) would otherwise blow up inside the model forward with
+            # an opaque shape error.
+            cfg = self.model.config
+            image_token_id = getattr(cfg, "image_token_id", None)
+            if "image_grid_thw" in img_proc and image_token_id is not None:
+                merge_size = getattr(self.processor.image_processor, "merge_size", 2)
+                grid = img_proc["image_grid_thw"]
+                n_vision = int((grid.prod(dim=-1) // (merge_size**2)).sum().item())
+                n_placeholder = int((input_ids == image_token_id).sum().item())
+                assert n_vision == n_placeholder, (
+                    f"vision token count mismatch: processor emits {n_vision} tokens "
+                    f"for {len(images)} frame(s) but input_ids has {n_placeholder} "
+                    f"image placeholders. Check that min/max_pixels match the values "
+                    f"used when generating this sample."
+                )
+
             # Qwen3.5-VL (Qwen3_5MoeForConditionalGeneration) requires mm_token_type_ids
             # for M-RoPE: 0=text, 1=image, 2=video. transformers>=5.8 raises if missing.
             # Older Qwen2.5-VL forward doesn't accept this kwarg; gate by signature.
+            # Multi-frame video is fed as images (image_token_id), so we only mark
+            # image positions -- never video_token (no video tokens are produced here).
             forward_params = inspect.signature(self.model.forward).parameters
             if "mm_token_type_ids" in forward_params:
-                cfg = self.model.config
-                image_token_id = getattr(cfg, "image_token_id", None)
-                video_token_id = getattr(cfg, "video_token_id", None)
                 mm_ids = torch.zeros_like(input_ids, dtype=torch.int32)
                 if image_token_id is not None:
                     mm_ids[input_ids == image_token_id] = 1
-                if video_token_id is not None:
-                    mm_ids[input_ids == video_token_id] = 2
                 model_inputs["mm_token_type_ids"] = mm_ids
 
         outputs = self.model(**model_inputs)
@@ -359,11 +388,18 @@ class HFDFlashTargetModel(DFlashTargetModel):
         else:
             hidden_states = outputs.hidden_states[-1].to(input_ids.device)
 
+        visual_token_mask = None
+        if self.is_vlm:
+            image_token_id = getattr(self.model.config, "image_token_id", None)
+            if image_token_id is not None:
+                visual_token_mask = (input_ids == image_token_id)
+
         return DFlashTargetOutput(
             hidden_states=hidden_states,
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            visual_token_mask=visual_token_mask,
         )
 
 

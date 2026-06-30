@@ -11,7 +11,22 @@
   "bos_token_id": 151643,
   "dflash_config": {
     "mask_token_id": 248070,
-    "target_layer_ids": [1, 10, 19, 28, 37]
+    "target_layer_ids": [1, 10, 19, 28, 37],
+    "video_adapter": {
+      "enabled": true,
+      "compression_mode": "perceiver_resampler",
+      "budget": 128,
+      "kv_mode": "draft_only",
+      "mask_fusion": "global_summary",
+      "image_token_id": 248056,
+      "num_resampler_layers": 2,
+      "num_resampler_heads": 32,
+      "num_resampler_kv_heads": 4,
+      "num_anchor_raw": 0,
+      "gate_init": 0.0,
+      "distill_hidden_weight": 0.0,
+      "distill_logit_weight": 0.0
+    }
   },
   "dtype": "bfloat16",
   "eos_token_id": 248046,

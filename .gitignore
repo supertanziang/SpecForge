@@ -200,3 +200,9 @@ model/
 logs/
 # macOS
 .DS_Store
+
+# Local data / artifacts (not for remote)
+datasets/
+results/
+visualization/
+nohup.out

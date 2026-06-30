@@ -324,3 +324,31 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python benchmark_sd_vlm.py \
 | aux 层不匹配 | 接受率 ~0 (即使 1D rope 对了) | 确保 config 有 `eagle_aux_hidden_state_layer_ids: [2,14,25]`（含 embedding 的索引） |
 | HOME 配额写爆 | torch.compile 卡住报 Disk quota exceeded | `export VLLM_CACHE_ROOT=/china-scratch/.../cache` |
 | 训练 acc vs acceptance_rate 差 2000 倍 | 正常,不是 bug | `acc`=严格 argmax 匹配(对应 T=0); `acceptance_rate`=采样理论值(对应 T>0) |
+
+---
+
+## 11. 视频评测集输出长度统计
+
+视频评测 (Video-MME / LongVideoBench) 输出长度极短，直接影响 speculative decoding 的加速效果。以下数据来自 `results/` 下的实测 JSON（每数据集 50 条）。
+
+### Qwen2.5-VL-7B（不开 thinking, T=0）
+
+| 数据集 | 平均 tokens | 中位数 | 范围 | P25–P75 | 总 tokens |
+|--------|------------|--------|------|---------|-----------|
+| Video-MME | 117 | 110 | 31–281 | 67–164 | 5856 |
+| LongVideoBench | 119 | 101 | 23–266 | 68–161 | 5939 |
+
+### Qwen3.5-35B-A3B（enable_thinking=True, max_tokens=4096）
+
+| 数据集 | 平均 tokens | 中位数 | 范围 | P25–P75 | 总 tokens |
+|--------|------------|--------|------|---------|-----------|
+| Video-MME | 2111 | 1572 | 294–4096 | 629–4096 | 105549 |
+| LongVideoBench | 3009 | 4096 | 424–4096 | 1807–4096 | 150435 |
+
+### 对加速比的影响
+
+- **不开 thinking**：输出仅 ~120 tokens，视频 16 帧 prefill 耗时占比极高 (prefill-bound)，decode 阶段太短导致 speculative decoding 几乎无加速空间。实测 7B dflash speedup 仅 0.90x。
+- **开 thinking 的 35B**：输出 2000–4000 tokens，decode 占比显著提升，但 16 帧 prefill 依然沉重，实测 35B dflash speedup 0.83–0.90x（接受率 0.4 远高于 7B 的 0.13，但无法转化为墙钟加速）。
+- **对比图文评测**：图文任务 (mmvet/textvqa 等) 图片 prefill 短得多，输出 ~200–500 tokens，7B dflash 可达 1.29x、35B 可达 1.38x。
+
+**结论**：视频场景 speculative decoding 的瓶颈不在接受率，而在 prefill 时间占比过高 + decode 输出过短。提升加速比需要：(1) 减少视频帧数 / 压缩视觉 token；(2) 开 thinking 增加输出长度；(3) 在 decode-bound 的长输出场景（如视频 CoT）评测才有意义。

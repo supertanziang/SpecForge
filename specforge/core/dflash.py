@@ -94,6 +94,46 @@ def create_dflash_block_mask(
     )
 
 
+def _count_before(visual_mask_1d: torch.Tensor, position: int) -> int:
+    """Count non-visual (text) tokens before a given position."""
+    return int((~visual_mask_1d[:position]).sum().item())
+
+
+def _remap_compressed_to_original(
+    compressed_anchors: torch.Tensor,
+    compression_info: dict,
+) -> torch.Tensor:
+    """Map anchor positions from compressed coordinate space back to original.
+
+    In compressed space: text_before(Nt_before) + compressed_visual(B) + text_after(Nt_after)
+    In original space: text_before + visual(Nv) + text_after
+
+    For anchors in text_before region: original_pos = compressed_pos (same)
+    For anchors in text_after region: original_pos = compressed_pos + (Nv - B)
+    Anchors never fall in visual region (loss_mask=0 there).
+    """
+    vis_start = compression_info["vis_start"]
+    n_vis_original = compression_info["n_vis_original"]
+    n_vis_compressed = compression_info["n_vis_compressed"]
+
+    # In compressed space, the visual block starts at the same index as vis_start
+    # in the text-before count (which equals vis_start since positions before
+    # vis_start are all text)
+    vis_start_compressed = _count_before(
+        compression_info["visual_mask"][0], vis_start
+    )
+    vis_end_compressed = vis_start_compressed + n_vis_compressed
+
+    removed = n_vis_original - n_vis_compressed
+    # Anchors after the compressed visual block need offset adjustment
+    offset = torch.where(
+        compressed_anchors >= vis_end_compressed,
+        torch.tensor(removed, device=compressed_anchors.device, dtype=torch.long),
+        torch.tensor(0, device=compressed_anchors.device, dtype=torch.long),
+    )
+    return compressed_anchors + offset
+
+
 class OnlineDFlashModel(nn.Module):
     """DFlash online training wrapper with block-wise CE loss."""
 
@@ -108,6 +148,7 @@ class OnlineDFlashModel(nn.Module):
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
         lm_head_chunk_size: Optional[int] = 512,
+        image_token_id: Optional[int] = None,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -118,10 +159,8 @@ class OnlineDFlashModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
-        # Chunk size (in rows) for the lm_head + cross-entropy pass. The full
-        # logits tensor over ~248k vocab is multi-GiB; chunking caps the peak.
-        # None means no chunking (dense path).
         self.lm_head_chunk_size = lm_head_chunk_size
+        self.image_token_id = image_token_id
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -140,7 +179,7 @@ class OnlineDFlashModel(nn.Module):
         max_n = min(self.num_anchors, int(valid_counts.max().item()) - 1)
 
         if max_n <= 0:
-            raise ValueError("should preprocess the data.")
+            return None, None
 
         indices = (
             torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
@@ -227,55 +266,181 @@ class OnlineDFlashModel(nn.Module):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
-        )
+        # --- Video adapter: pre-compress visual tokens before mask/anchor creation ---
+        adapter = self.draft_model.video_adapter
+        compression_info = None
+        compressed_visual = None
+        compressed_target_hidden = None
 
-        noise_embedding = self._create_noise_embed(
-            input_ids, anchor_positions, block_keep_mask
-        )
+        if adapter is not None and self.image_token_id is not None:
+            visual_mask = (input_ids == self.image_token_id)
+            if visual_mask.any() and adapter.kv_mode != "off":
+                # Run fc + norm first to get the representation adapter operates on
+                projected_hidden = self.draft_model.hidden_norm(
+                    self.draft_model.fc(hidden_states)
+                )
+                compressed_target_hidden, compressed_visual, compression_info = (
+                    adapter.compress(projected_hidden, input_ids)
+                )
 
-        context_position_ids = (
-            torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
-        )
-        draft_position_ids = self._create_position_ids(anchor_positions)
-        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+        if compression_info is not None:
+            # Use compressed context length for anchor sampling and mask
+            S_compressed = compression_info["S_compressed"]
 
-        if self.attention_backend == "flex_attention":
-            dflash_attn_mask = create_dflash_block_mask(
-                anchor_positions=anchor_positions,
-                block_keep_mask=block_keep_mask,
-                S=seq_len,
-                block_size=self.block_size,
-                device=device,
+            # Remap loss_mask: remove visual positions, insert budget-sized zeros
+            # (visual positions have loss_mask=0, so compressed budget also = 0)
+            vis_mask_1d = compression_info["visual_mask"][0]
+            text_loss = loss_mask[:, ~vis_mask_1d]  # [bsz, Nt]
+            vis_start_idx = _count_before(vis_mask_1d, compression_info["vis_start"])
+            n_compressed = compression_info["n_vis_compressed"]
+            # Insert zeros at visual position in compressed space
+            compressed_loss_mask = torch.cat(
+                [
+                    text_loss[:, :vis_start_idx],
+                    torch.zeros(bsz, n_compressed, device=device, dtype=loss_mask.dtype),
+                    text_loss[:, vis_start_idx:],
+                ],
+                dim=1,
             )
+
+            anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                S_compressed, compressed_loss_mask, device
+            )
+
+            if anchor_positions is None:
+                # Not enough valid positions after compression — skip this sample
+                zero = torch.tensor(0.0, device=device, requires_grad=True)
+                return zero, zero.detach()
+
+            noise_embedding = self._create_noise_embed(
+                input_ids, anchor_positions, block_keep_mask
+            )
+
+            # Position IDs: context uses compressed position mapping
+            context_position_ids = adapter.build_compressed_position_ids(
+                input_ids, compression_info
+            )
+            draft_position_ids = self._create_position_ids(anchor_positions)
+            full_position_ids = torch.cat(
+                [context_position_ids, draft_position_ids], dim=1
+            )
+
+            if self.attention_backend == "flex_attention":
+                dflash_attn_mask = create_dflash_block_mask(
+                    anchor_positions=anchor_positions,
+                    block_keep_mask=block_keep_mask,
+                    S=S_compressed,
+                    block_size=self.block_size,
+                    device=device,
+                )
+            else:
+                dflash_attn_mask = create_dflash_sdpa_mask(
+                    anchor_positions=anchor_positions,
+                    block_keep_mask=block_keep_mask,
+                    S=S_compressed,
+                    block_size=self.block_size,
+                    device=device,
+                )
+
+            # Fuse compressed visual into noise embedding
+            if compressed_visual is not None:
+                noise_embedding = adapter.fuse_mask(noise_embedding, compressed_visual)
+
+            output_hidden = self.draft_model(
+                position_ids=full_position_ids,
+                noise_embedding=noise_embedding,
+                target_hidden=compressed_target_hidden,
+                attention_mask=dflash_attn_mask,
+                skip_adapter=True,
+            )
+
+            # Labels still reference original input_ids positions
+            effective_seq_len = seq_len
         else:
-            dflash_attn_mask = create_dflash_sdpa_mask(
-                anchor_positions=anchor_positions,
-                block_keep_mask=block_keep_mask,
-                S=seq_len,
-                block_size=self.block_size,
-                device=device,
+            # Standard path (no adapter or no visual tokens or kv_mode=off)
+            anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                seq_len, loss_mask, device
             )
 
-        output_hidden = self.draft_model(
-            position_ids=full_position_ids,
-            noise_embedding=noise_embedding,
-            target_hidden=hidden_states,
-            attention_mask=dflash_attn_mask,
-        )
+            if anchor_positions is None:
+                zero = torch.tensor(0.0, device=device)
+                return zero, zero
 
-        # NOTE: we intentionally do NOT materialize the full logits tensor here.
-        # lm_head projects to the full vocab (~248k); for N anchor*block rows this
-        # is a multi-GiB tensor (plus its grad) and was the single largest memory
-        # spike, blocking single-card target placement. We chunk the lm_head +
-        # cross-entropy over rows below (numerically identical to the dense path).
+            noise_embedding = self._create_noise_embed(
+                input_ids, anchor_positions, block_keep_mask
+            )
+
+            context_position_ids = (
+                torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            )
+            draft_position_ids = self._create_position_ids(anchor_positions)
+            full_position_ids = torch.cat(
+                [context_position_ids, draft_position_ids], dim=1
+            )
+
+            if self.attention_backend == "flex_attention":
+                dflash_attn_mask = create_dflash_block_mask(
+                    anchor_positions=anchor_positions,
+                    block_keep_mask=block_keep_mask,
+                    S=seq_len,
+                    block_size=self.block_size,
+                    device=device,
+                )
+            else:
+                dflash_attn_mask = create_dflash_sdpa_mask(
+                    anchor_positions=anchor_positions,
+                    block_keep_mask=block_keep_mask,
+                    S=seq_len,
+                    block_size=self.block_size,
+                    device=device,
+                )
+
+            # When adapter exists but kv_mode=off, still do mask fusion
+            if adapter is not None and self.image_token_id is not None:
+                visual_mask = (input_ids == self.image_token_id)
+                if visual_mask.any():
+                    projected_hidden = self.draft_model.hidden_norm(
+                        self.draft_model.fc(hidden_states)
+                    )
+                    _, compressed_visual_only, _ = adapter.compress(
+                        projected_hidden, input_ids
+                    )
+                    if compressed_visual_only is not None:
+                        noise_embedding = adapter.fuse_mask(
+                            noise_embedding, compressed_visual_only
+                        )
+
+            output_hidden = self.draft_model(
+                position_ids=full_position_ids,
+                noise_embedding=noise_embedding,
+                target_hidden=hidden_states,
+                attention_mask=dflash_attn_mask,
+                input_ids=input_ids if adapter is None else None,
+            )
+
+            effective_seq_len = seq_len
 
         # --- Labels: same-position prediction (position k predicts token anchor+k) ---
-        label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
-        label_indices = anchor_positions.unsqueeze(-1) + label_offsets
-        valid_label_mask = label_indices < seq_len
-        safe_label_indices = label_indices.clamp(max=seq_len - 1)
+        # anchor_positions are in compressed space when adapter is active,
+        # but labels still come from original input_ids. We need to map back.
+        if compression_info is not None:
+            # Anchors are in compressed space; map to original positions for labels
+            orig_anchor_positions = _remap_compressed_to_original(
+                anchor_positions, compression_info
+            )
+            label_offsets = torch.arange(0, self.block_size, device=device).view(
+                1, 1, -1
+            )
+            label_indices = orig_anchor_positions.unsqueeze(-1) + label_offsets
+            valid_label_mask = label_indices < seq_len
+            safe_label_indices = label_indices.clamp(max=seq_len - 1)
+        else:
+            label_offsets = torch.arange(0, self.block_size, device=device).view(
+                1, 1, -1
+            )
+            label_indices = anchor_positions.unsqueeze(-1) + label_offsets
+            valid_label_mask = label_indices < seq_len
+            safe_label_indices = label_indices.clamp(max=seq_len - 1)
 
         target_ids = torch.gather(
             input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
@@ -318,10 +483,6 @@ class OnlineDFlashModel(nn.Module):
         chunk_size = self.lm_head_chunk_size or num_rows
 
         def _chunk_loss(hidden_chunk, target_chunk, weight_chunk):
-            # Recomputed under activation checkpointing: the (rows x vocab) logits
-            # tensor is never kept for backward, only re-formed transiently. This
-            # is what actually caps the peak — a plain chunked loop still retains
-            # every chunk's logits in the autograd graph until backward.
             chunk_logits = self.lm_head(hidden_chunk)
             chunk_loss = F.cross_entropy(
                 chunk_logits, target_chunk, reduction="none"
@@ -335,8 +496,6 @@ class OnlineDFlashModel(nn.Module):
             hidden_chunk = flat_hidden[start:end]
             target_chunk = flat_targets[start:end]
             weight_chunk = flat_weights[start:end]
-            # Accuracy first, fully under no_grad, so its transient logits are
-            # freed before the grad-tracked loss pass allocates the next ones.
             with torch.no_grad():
                 chunk_pred = torch.argmax(self.lm_head(hidden_chunk), dim=-1)
                 chunk_correct = (chunk_pred == target_chunk) & (

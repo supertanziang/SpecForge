@@ -5,8 +5,15 @@
     {
       "input_ids":  list[int],   # 完整 token 序列(prompt + 目标生成), 已含图像占位 token
       "loss_mask":  list[int],   # 0=prompt(含图像 token), 1=生成段
-      "image_file": str,         # 图片绝对路径
+      "image_file":  str,         # 单图绝对路径(旧格式, 向后兼容)
+      "image_files": list[str],   # 多帧绝对路径(视频=抽帧成多图, 见 gen_video_dflash_data.py)
     }
+
+图片字段统一归一为 `image_files: list[str]`(详见 __getitem__):
+  - 有 `image_files` -> 直接用(视频多帧);
+  - 否则有 `image_file` -> 包成 `[image_file]`(单图);
+  - 都没有 -> `[]`(纯文本)。
+单图 = N=1 的多图, 让下游(target forward)无需区分单图/视频两条分支。
 
 设计参考 ViSpec `vispec/train/online_dataset.py` 的 OnlineMMDataset:
   - 数据集只返回「原始输入」(input_ids / loss_mask / image_file);
@@ -48,15 +55,22 @@ class OnlineMMDataset(Dataset):
         rec = self.records[index]
         input_ids = torch.tensor(rec["input_ids"][: self.max_len], dtype=torch.long)
         loss_mask = torch.tensor(rec["loss_mask"][: self.max_len], dtype=torch.long)
+        # 归一图片字段: image_files(多帧) 优先 -> image_file(单图)包成 list -> [](纯文本)
+        if rec.get("image_files"):
+            image_files = list(rec["image_files"])
+        elif rec.get("image_file"):
+            image_files = [rec["image_file"]]
+        else:
+            image_files = []
         return {
             "input_ids": input_ids,  # [S]
             "loss_mask": loss_mask,  # [S]
-            "image_file": rec["image_file"],  # str
+            "image_files": image_files,  # list[str]
         }
 
 
 class OnlineMMCollator:
-    """bs=1 collator:input_ids/loss_mask 升为 [1, S],attention_mask 现生成全 1,image_file 透传。"""
+    """bs=1 collator:input_ids/loss_mask 升为 [1, S],attention_mask 现生成全 1,image_files 透传。"""
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         assert len(features) == 1, "DFlash VLM 训练仅支持 batch_size=1"
@@ -68,7 +82,7 @@ class OnlineMMCollator:
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "loss_mask": loss_mask,
-            "image_file": f["image_file"],
+            "image_files": f["image_files"],  # list[str]
         }
 
 

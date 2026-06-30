@@ -55,12 +55,17 @@ ANSWER_SUFFIX = (
 
 
 def adaptive_num_frames(duration_sec: float) -> int:
+    # 放开原来的 16 帧硬上限: >30s 的视频帧数随时长线性增长 (每 30s 抽 1 帧),
+    # 更贴近真实长视频理解需求 (代价是 prefill 更重)。MAX_FRAMES 只是防止超长
+    # 视频 (如 3472s -> 116 帧) 把 vision token 撑爆 max-model-len 的安全护栏,
+    # 不是原来那种「一刀切 16」的预算上限。
+    MAX_FRAMES = 48
     if duration_sec <= 10:
         return 4
     elif duration_sec <= 30:
         return 8
     else:
-        return 16
+        return min(MAX_FRAMES, max(16, round(duration_sec / 30)))
 
 
 def _get_video_duration(path: str) -> float:
